@@ -1,0 +1,5 @@
+# GEO 工具箱：3 个技能快照（单页体检 / 全流程优化 / 服务流水线）。
+# 浏览器半边由 dsh.client 声明加载。
+- insert:
+    - id: geo-optimizer
+      name: 'dsh-geo-optimizer'

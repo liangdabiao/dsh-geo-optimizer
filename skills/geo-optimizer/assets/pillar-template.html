@@ -1,0 +1,28 @@
+<!-- Pillar Page Cluster Template -->
+<!-- Copy and customize for each pillar page -->
+<!-- Place this block at the end of each cluster article -->
+
+<div class="pillar-cluster">
+  <h2>推荐文章集群：{{pillar_title}}</h2>
+
+  <p><strong>[选品阶段]</strong> <a href="/{{slug-1}}/">{{子主题标题1}}</a></p>
+  <p><strong>[运营阶段]</strong> <a href="/{{slug-2}}/">{{子主题标题2}}</a></p>
+  <p><strong>[内容阶段]</strong> <a href="/{{slug-3}}/">{{子主题标题3}}</a></p>
+  <p><strong>[分析阶段]</strong> <a href="/{{slug-4}}/">{{子主题标题4}}</a></p>
+  <p><strong>[系统搭建]</strong> <a href="/{{slug-5}}/">{{子主题标题5}}</a></p>
+</div>
+
+<!--
+Site Map JSON structure (for reference):
+
+{
+  "pillar": "{{pillar-slug}}",
+  "children": ["{{slug-1}}", "{{slug-2}}", "{{slug-3}}", "{{slug-4}}", "{{slug-5}}"]
+}
+
+Rules:
+- 1 pillar page + 5-10 child articles
+- Each child links back to pillar page
+- Pillar page links to all children
+- Use contextual anchor text, not "click here"
+-->
