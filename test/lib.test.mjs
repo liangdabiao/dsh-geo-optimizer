@@ -98,3 +98,49 @@ test('面板 API 鉴权 fail closed', () => {
 test('LICENSE 为 MIT', () => {
   assert.match(readFileSync(join(ROOT, 'LICENSE'), 'utf8'), /MIT/)
 })
+
+// ── 升级新增：geo_audit ─────────────────────────────────────
+process.env.DSH_HOME = new URL('../.tmp/test-home/', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:')
+
+const { auditContent } = await import('../lib/audit.js')
+const data = await import('../lib/data.js')
+const host = await import('../src/host.js')
+
+test('audit: 四维打分——优质内容高分、空洞内容低分', () => {
+  const rich = auditContent([
+    '# GEO 是什么：生成式引擎优化入门',
+    'GEO 是指生成式引擎优化（Generative Engine Optimization）。',
+    '据行业报告显示，2024 年 AI 引用流量增长了 3.2 倍。',
+    '来源：某研究院年度报告。',
+    '- 转化率提升 25%',
+    '- 留存率提升 40%',
+    '## 常见问题',
+    'GEO 和 SEO 的区别是什么？',
+    '详情见 https://example.com/geo-report',
+  ].join('\n\n'), { title: 'GEO 入门' })
+  const poor = auditContent('我们公司很好，欢迎联系我们。')
+  assert.ok(rich.score > poor.score + 30, `优质 ${rich.score} 应远高于空洞 ${poor.score}`)
+  assert.ok(rich.dimensions.citations >= 15)
+  assert.ok(poor.findings.length >= 2)
+  assert.equal(auditContent('').ok, false)
+})
+
+test('host: geo_audit audit/compare/history/delete 全链路', async () => {
+  assert.equal(host.name, 'geo-optimizer')
+  assert.equal(host.geoAuditTool.parameters.additionalProperties, false)
+  await assert.rejects(() => host.geoAuditTool.execute({ action: 'audit', bogus: 1 }), /未知参数/)
+  await assert.rejects(() => host.geoAuditTool.execute({ action: 'audit' }), /需要 content/)
+  host.apply(
+    { effect: (fn) => { try { fn() } catch {} }, tools: { register: () => {} }, skills: { registerProvider: () => {} }, systemPrompt: { section: () => {} }, webServer: { register: () => {} } },
+    { injectRules: false })
+  const audit = await host.geoAuditTool.execute({ action: 'audit', content: 'GEO 是指生成式引擎优化。据报告显示 2024 年增长 3 倍。\n\n## FAQ\nGEO 是什么？', title: '测试稿' })
+  assert.equal(audit.ok, true)
+  const hist = await host.geoAuditTool.execute({ action: 'history' })
+  assert.ok(hist.data.includes('测试稿'))
+  const beforeId = /id=(audit-\d+)/.exec(hist.data)?.[1]
+  const cmp = await host.geoAuditTool.execute({ action: 'compare', before_id: beforeId, content_after: '# GEO 指南\nGEO 是指生成式引擎优化。\n\n## FAQ\nGEO 是什么？据报告显示 2024 年增长 3.2 倍。\n- 转化率 25%\n来源：https://example.com' })
+  assert.equal(cmp.ok, true)
+  assert.ok(/\+\d+ 分|\. 分/.test(cmp.summary) || cmp.summary.includes('→'))
+  const noConfirm = await host.geoAuditTool.execute({ action: 'delete', id: beforeId })
+  assert.equal(noConfirm.ok, false)
+})

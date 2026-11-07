@@ -67,16 +67,57 @@ function SkillsTab() {
       h('div', { style: styles.skillDesc }, s.description.length > 220 ? s.description.slice(0, 220) + '…' : s.description))))
 }
 
+
+// ---------- 审计历史 ----------
+function fmtTime(iso) {
+  try {
+    const d = new Date(iso)
+    return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')
+  } catch { return iso || '' }
+}
+const DIM_LABELS = { citations: '引用数据', structure: '结构化', qa: '问答友好', authority: '权威信号' }
+
+function scoreColor(score) {
+  return score >= 70 ? '#1a7f37' : score >= 40 ? '#b58a00' : '#c0392b'
+}
+
+function AuditsTab() {
+  const [audits, setAudits] = useState(null)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    fetchJson('/api/audits').then((d) => setAudits(d.audits)).catch((e) => setError(e.message))
+  }, [])
+  if (error) return h('div', { style: styles.error }, error)
+  if (audits === null) return h('div', { style: styles.muted }, '加载中…')
+  if (!audits.length) {
+    return h('div', { style: styles.muted },
+      '还没有审计记录。在对话里说「给这篇内容打个 GEO 分」，模型会用 geo_audit 打分并列出改进清单。')
+  }
+  return h('div', null, audits.map((r) => h('div', { key: r.id, style: styles.card },
+    h('div', { style: styles.row },
+      h('span', { style: { fontWeight: 800, fontSize: 20, color: scoreColor(r.score) } }, String(r.score)),
+      h('div', null,
+        h('div', { style: styles.auditTitle }, r.title),
+        h('div', { style: styles.mutedSmall }, fmtTime(r.ts))),
+      h('span', { style: { marginLeft: 'auto', ...styles.mutedSmall } },
+        Object.entries(r.dimensions || {}).map(([k, v]) => (DIM_LABELS[k] || k) + ' ' + v).join(' · '))),
+    (r.findings || []).slice(0, 4).map((f, i) => h('div', { key: i, style: styles.finding }, '- ' + f)))))
+}
+
 function Panel() {
-  const [tab, setTab] = useState('guide')
+  const [tab, setTab] = useState('audits')
   return h('div', { style: styles.wrap },
     h('div', { style: styles.row },
+      h('button', { style: tab === 'audits' ? styles.tabActive : styles.tab, onClick: () => setTab('audits') }, '📊 审计历史'),
       h('button', { style: tab === 'guide' ? styles.tabActive : styles.tab, onClick: () => setTab('guide') }, '📖 工具选择'),
       h('button', { style: tab === 'skills' ? styles.tabActive : styles.tab, onClick: () => setTab('skills') }, '📋 技能目录')),
-    tab === 'guide' ? h(GuideTab) : h(SkillsTab))
+    tab === 'audits' ? h(AuditsTab) : tab === 'guide' ? h(GuideTab) : h(SkillsTab))
 }
 
 const styles = {
+  auditTitle: { fontWeight: 600, fontSize: 13 },
+  finding: { color: '#4a4a50', fontSize: 12, lineHeight: 1.7 },
+  mutedSmall: { color: '#a0a0a8', fontSize: 12, lineHeight: 1.7 },
   wrap: { padding: 16, overflow: 'auto', height: '100%', boxSizing: 'border-box', fontFamily: '-apple-system, "Segoe UI", "Microsoft YaHei", sans-serif', fontSize: 13, color: '#1a1a1a' },
   row: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 10 },
   button: { padding: '6px 14px', border: 'none', borderRadius: 8, background: '#5b21b6', color: '#fff', cursor: 'pointer', fontSize: 13 },
