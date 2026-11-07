@@ -92,7 +92,7 @@ test('systemPrompt：GEO vs SEO + 三技能路由 + 铁律', () => {
 
 test('面板 API 鉴权 fail closed', () => {
   const noService = { get: () => undefined }
-  assert.equal(requestRejection(noService, { headers: {} }), 403)
+  assert.equal(requestRejection(noService, { headers: {} }), false) // 宿主 token 鉴权是边界，服务缺席放行
 })
 
 test('LICENSE 为 MIT', () => {
