@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -46,11 +47,20 @@ def _site_digest(slug: str, limit: int = 14000) -> str:
     return "".join(parts)
 
 
-def _ask_json(prompt: str, provider: str | None = None, timeout: int = 300) -> dict | None:
-    """调 LLM 并解析出 JSON。抽不出就返回 None，由调用方降级处理。"""
+# 「把官网正文抽成 JSON」不需要推理，要的是快和稳定。
+# 原来候选表里 deepseek 排第一（推理模型，单次 90-365s），是 bootstrap 慢的根因。
+FAST_FOR_JSON = ["kimi", "glm", "openai", "gemini", "doubao", "deepseek"]
+
+
+def _ask_json(prompt: str, provider: str | None = None, timeout: int = 90) -> dict | None:
+    """调 LLM 并解析出 JSON。抽不出就返回 None，由调用方降级处理。
+
+    provider 可用环境变量 GEO_BOOTSTRAP_PROVIDER 指定；默认走快模型。
+    """
     import sample as S
 
-    cands = [provider] if provider else ["deepseek", "glm", "doubao", "openai", "gemini"]
+    env_pick = os.environ.get("GEO_BOOTSTRAP_PROVIDER")
+    cands = [provider] if provider else ([env_pick] if env_pick else FAST_FOR_JSON)
     plat = next((p for p in cands if p and S.available(p)), None)
     if not plat:
         return None
@@ -140,26 +150,39 @@ QUESTION_PROMPT = """你是 GEO 分析师。根据下面的品牌信息，设计
 """
 
 
-def question_bank(brand: dict, market: str) -> list[dict]:
-    hint = {"cn": "只出国内（cn）问题，18-24 题",
-            "global": "只出海外（global）问题，14-20 题",
-            "both": "国内 16-20 题 + 海外 12-16 题 + 通用 2 题"}[market]
-    G.info("  设计问题库…")
+def question_bank(brand: dict, market: str, per_group: int = 2) -> list[dict]:
+    """设计问题库。
+
+    per_group 是成本闸门：每题 × 每平台 = 一次 AI 调用，所以题量直接决定采样时长。
+    七组是底线（每组测的东西不同，不能 merged），每组几题按 profile 调：
+    quick=1（7-9 题）、standard=2（14 题）、deep=4（24-28 题）。
+    """
+    n_cn = 7 * per_group
+    hint = {"cn": f"只出国内（cn）问题，七组每组 {per_group} 题，共约 {n_cn} 题",
+            "global": f"只出海外（global）问题，七组每组 {per_group} 题，共约 {n_cn} 题",
+            "both": (f"国内七组每组 {per_group} 题 + 海外七组每组 {max(1, per_group - 1)} 题"
+                     f" + 通用 2 题")}[market]
+    G.info(f"  设计问题库（每组 {per_group} 题）…")
     data = _ask_json(QUESTION_PROMPT.format(
         name=brand.get("name", ""), industry=brand.get("industry", ""),
         target_users=brand.get("target_users", ""), definition=brand.get("definition", ""),
         market_hint=hint))
     qs = (data or {}).get("questions") or []
-    out, seen = [], set()
+    out, seen, per_group_kept = [], set(), {}
     for q in qs:
         t = (q.get("text") or "").strip()
         mk = q.get("market") if q.get("market") in ("cn", "global", "both") else market
         if not t or t in seen or (market != "both" and mk not in (market, "both")):
             continue
+        g = q.get("group") if q.get("group") in GROUPS else "推荐"
+        # 硬封顶：模型经常多给，多给的每一题都是真金白银的采样成本
+        cap = per_group if market != "both" else (per_group if mk == "cn" else max(1, per_group - 1))
+        if per_group_kept.get((g, mk), 0) >= cap:
+            continue
+        per_group_kept[(g, mk)] = per_group_kept.get((g, mk), 0) + 1
         seen.add(t)
         out.append({"id": q.get("id") or f"q{len(out)+1:03d}",
-                    "group": q.get("group") if q.get("group") in GROUPS else "推荐",
-                    "market": mk, "text": t})
+                    "group": g, "market": mk, "text": t})
     return out
 
 
@@ -276,7 +299,7 @@ def render_facts(slug: str, brand: dict) -> str:
 
 # ---------------------------------------------------------------- 主流程
 
-def run(slug: str, skip_llm: bool = False) -> dict:
+def run(slug: str, skip_llm: bool = False, per_group: int = 2) -> dict:
     cfg = G.load_config(slug)
     market = cfg.get("market", "cn")
     digest = _site_digest(slug)
@@ -310,8 +333,23 @@ def run(slug: str, skip_llm: bool = False) -> dict:
                         "currency": p.get("currency", "CNY"), "desc": p.get("desc", "")}
                        for p in brand["pricing"]]
 
-    cfg["competitors"] = competitors(brand, market) or cfg.get("competitors", [])
-    cfg["questions"] = question_bank(brand, market) or cfg.get("questions", [])
+    # 这两步都只依赖 brand_facts 的产出，互不依赖 → 并行跑，省掉一次模型延迟
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_comp = pool.submit(competitors, brand, market)
+        f_qs = pool.submit(question_bank, brand, market, per_group)
+        try:
+            comp = f_comp.result()
+        except Exception as e:  # noqa: BLE001
+            G.info(f"  竞品推导失败（可手工补）：{type(e).__name__}: {e}")
+            comp = []
+        try:
+            qs = f_qs.result()
+        except Exception as e:  # noqa: BLE001
+            G.info(f"  问题库推导失败（可手工补）：{type(e).__name__}: {e}")
+            qs = []
+    cfg["competitors"] = comp or cfg.get("competitors", [])
+    cfg["questions"] = qs or cfg.get("questions", [])
     cfg["bootstrap"] = {"at": G.now_iso(), "source": "官网正文 + LLM 抽取",
                         "uncertain": brand.get("uncertain") or [],
                         "needs_review": True}

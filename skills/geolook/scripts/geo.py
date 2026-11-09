@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
+    import budget as BUDGET  # noqa: E402
     import geolib as G  # noqa: E402
 except ModuleNotFoundError as e:
     raise SystemExit(f"缺少依赖：{e.name}。请先 pip3 install requests beautifulsoup4 lxml") from e
@@ -34,6 +35,71 @@ DEFAULT_PLATFORMS = {
     "both": ["glm", "doubao", "deepseek", "kimi", "minimax", "nano_ai", "baidu",
              "gemini", "openai", "claude", "grok", "perplexity", "chatgpt"],
 }
+
+
+GROUPS_SEVEN = ("推荐", "比较", "替代", "价格", "风险", "品牌验证", "场景")
+
+
+def _profile_of(a, slug: str | None = None) -> dict:
+    """profile 解析顺序：命令行 > geo.json 里存的 > 默认 standard。"""
+    name = getattr(a, "profile", None)
+    if not name and slug:
+        p = G.project_dir(slug) / "geo.json"
+        if p.exists():
+            name = (G.read_json(p, {}).get("profile") or {}).get("name")
+    return BUDGET.profile(name)
+
+
+def _budget_minutes(a, prof: dict) -> float:
+    b = getattr(a, "budget", None)
+    return prof["sample_minutes"] if b is None else float(b)
+
+
+def _effective_questions(cfg: dict, prof: dict, all_questions: bool = False) -> int:
+    """profile 封顶后的实际题量——预估和闸门都按这个数算，不是按题库总题数。"""
+    qs = cfg.get("questions") or []
+    if not qs:
+        # 还没有问题库（new 的预估阶段）：按 profile 的预期题量算，
+        # 否则"采样"这一步会从预估表里凭空消失，用户以为只要 3 分钟。
+        return len(GROUPS_SEVEN) * prof["per_group"]
+    if all_questions:
+        return len(qs)
+    groups: dict[str, int] = {}
+    kept = 0
+    for q in qs:
+        g = q.get("group") or "推荐"
+        if groups.get(g, 0) >= prof["per_group"]:
+            continue
+        groups[g] = groups.get(g, 0) + 1
+        kept += 1
+    return kept
+
+
+def _preflight(a, slug: str | None = None, cfg: dict | None = None,
+               full: bool = True) -> dict:
+    """开工前的预估表。--estimate 只看不跑；否则按预算决定要不要用户点头。"""
+    prof = _profile_of(a, slug)
+    if cfg is None:
+        p = G.project_dir(slug) / "geo.json" if slug else None
+        cfg = G.load_config(slug) if (p and p.exists()) else {}
+    market = cfg.get("market") or getattr(a, "market", "cn")
+    pages = getattr(a, "max_pages", None) or prof["pages"]
+    qn = _effective_questions(cfg, prof, getattr(a, "all_questions", False))
+    drafts = getattr(a, "draft_limit", 0) if getattr(a, "draft", False) else 0
+    est = BUDGET.estimate_pipeline(prof["name"], market, pages,
+                                   qn if not getattr(a, "no_sample", False) else 0,
+                                   repeat=getattr(a, "repeat", 1) or 1, drafts=drafts)
+    if getattr(a, "estimate", False):
+        print(BUDGET.table(est))
+        raise SystemExit(0)
+    if full:
+        G.info(f"profile={prof['name']}（{prof['label']}）：约 {est['minutes']} 分钟")
+    return {"est": est, "prof": prof, "budget": _budget_minutes(a, prof)}
+
+
+def _guard(a, pre: dict):
+    # 预估表已经在 _preflight 之后打印过，这里只做判定，别再刷一遍
+    BUDGET.guard(pre["est"], pre["budget"], getattr(a, "yes", False), show_table=False)
 
 
 def cmd_init(a):
@@ -77,7 +143,8 @@ def cmd_init(a):
         },
         "competitors": [],
         "platforms": DEFAULT_PLATFORMS[a.market],
-        "pages": {"seed": [], "max": a.max_pages},
+        "pages": {"seed": [], "max": a.max_pages or _profile_of(a)["pages"]},
+        "profile": {"name": _profile_of(a)["name"], "per_group": _profile_of(a)["per_group"]},
         "questions": [],
         "materials": [],
         "targets": {"mention_rate": 0.5, "top3_rate": 0.3, "avg_page_score": 75},
@@ -117,15 +184,24 @@ def cmd_new(a):
     import tasks
     import verify as V
 
+    pre = _preflight(a, cfg={"market": getattr(a, "market", "cn")}, full=False)
+    print(BUDGET.table(pre["est"]))
+    _guard(a, pre)
+    timer = BUDGET.Timer()
+    timer.mark("start")
+
     G.info("═══ 1/9 建项目 ═══")
     cfg = cmd_init(a)
     slug = cfg["slug"]
+    timer.mark("建项目")
     G.info("═══ 2/9 抓取官网 ═══")
     C.run(slug, max_pages=a.max_pages)
     G.info("═══ 3/9 体检 ═══")
     A.run(slug)
+    timer.mark("抓取与体检")
     G.info("═══ 4/9 自动推导品牌事实、竞品与问题库 ═══")
-    bootstrap.run(slug, skip_llm=a.skip_llm)
+    bootstrap.run(slug, skip_llm=a.skip_llm, per_group=pre["prof"]["per_group"])
+    timer.mark("自动推导底座")
     G.info("═══ 5/9 重跑体检（问题库影响对题性评分）═══")
     A.run(slug)
     G.info("═══ 6/9 AI 答案采样 ═══")
@@ -135,9 +211,12 @@ def cmd_new(a):
         G.info("跳过：问题库为空")
     else:
         try:
-            S.run(slug, limit=a.limit)
+            S.run(slug, limit=a.limit, profile_name=pre["prof"]["name"],
+                  budget_minutes=pre["budget"], assume_yes=getattr(a, "yes", False),
+                  all_questions=getattr(a, "all_questions", False))
         except Exception as e:  # noqa: BLE001
             G.info(f"采样跳过：{type(e).__name__}: {e}")
+    timer.mark("采样")
     G.info("═══ 7/9 工单与建设蓝图 ═══")
     tasks.build(slug)
     BP.build(slug)
@@ -152,6 +231,8 @@ def cmd_new(a):
         G.info(f"验收失败：{e}")
     deliver.run(slug)
     G.info("")
+    timer.mark("资产与报告")
+    print(timer.summary())
     G.info(f"完成。交付物在 work/{slug}/deliverables/：")
     G.info("  1-GEO诊断报告.html   现在什么样")
     G.info("  2-GEO优化方案.html   应该改成什么样")
@@ -176,13 +257,19 @@ def cmd_autopilot(a):
     import verify as V
 
     cfg = G.load_config(a.slug)
+    pre = _preflight(a, slug=a.slug, cfg=cfg, full=False)
+    print(BUDGET.table(pre["est"]))
+    _guard(a, pre)
+    timer = BUDGET.Timer()
+    timer.mark("start")
     G.info("═══ 1/8 抓取官网 ═══")
-    C.run(a.slug)
+    C.run(a.slug, max_pages=getattr(a, "max_pages", None))
     G.info("═══ 2/8 体检 ═══")
     A.run(a.slug)
     if not cfg.get("questions"):
         G.info("═══ 3/8 自动推导品牌事实、竞品与问题库 ═══")
-        bootstrap.run(a.slug, skip_llm=a.skip_llm)
+        bootstrap.run(a.slug, skip_llm=a.skip_llm, per_group=pre["prof"]["per_group"])
+        timer.mark("自动推导底座")
         A.run(a.slug)
     else:
         G.info("═══ 3/8 已有问题库，跳过自动推导 ═══")
@@ -194,6 +281,7 @@ def cmd_autopilot(a):
             S.run(a.slug, limit=a.limit)
         except Exception as e:  # noqa: BLE001
             G.info(f"采样跳过：{type(e).__name__}: {e}")
+    timer.mark("采样")
     G.info("═══ 5/8 工单与建设蓝图 ═══")
     tasks.build(a.slug)
     BP.build(a.slug)
@@ -226,8 +314,19 @@ def cmd_audit(a):
 def cmd_sample(a):
     import sample
 
+    cfg = G.load_config(a.slug)
+    prof = _profile_of(a, a.slug)
+    if not getattr(a, "estimate", False):
+        qn = _effective_questions(cfg, prof, getattr(a, "all_questions", False))
+        est = BUDGET.estimate_pipeline(prof["name"], cfg.get("market", "cn"), 0, qn,
+                                       repeat=a.repeat or 1)
+        BUDGET.guard(est, _budget_minutes(a, prof), getattr(a, "yes", False))
     sample.run(a.slug, platforms=a.platforms.split(",") if a.platforms else None,
-               repeat=a.repeat, limit=a.limit)
+               repeat=a.repeat, limit=a.limit, profile_name=prof["name"],
+               budget_minutes=_budget_minutes(a, prof),
+               assume_yes=getattr(a, "yes", False),
+               all_questions=getattr(a, "all_questions", False),
+               estimate_only=getattr(a, "estimate", False))
 
 
 def cmd_sheet(a):
@@ -254,21 +353,34 @@ def cmd_cycle(a):
     import report
     import sample
 
+    pre = _preflight(a, slug=a.slug, full=False)
+    print(BUDGET.table(pre["est"]))
+    _guard(a, pre)
+    timer = BUDGET.Timer()
+    timer.mark("start")
     G.info("=== 1/4 抓取 ===")
     crawl.run(a.slug, max_pages=a.max_pages)
     G.info("=== 2/4 体检 ===")
     audit.run(a.slug)
+    timer.mark("抓取与体检")
     G.info("=== 3/4 采样 ===")
     # 采样失败不能把整期带崩：报告和待办比采样更重要
     if not G.load_config(a.slug).get("questions"):
         G.info("跳过采样：geo.json 里还没有问题库（见 SKILL.md 步骤 2）")
     else:
         try:
-            sample.run(a.slug, limit=a.limit)
+            sample.run(a.slug, limit=a.limit, profile_name=pre["prof"]["name"],
+                       budget_minutes=pre["budget"],
+                       assume_yes=getattr(a, "yes", False),
+                       all_questions=getattr(a, "all_questions", False))
+        except SystemExit:
+            raise
         except Exception as e:  # noqa: BLE001
             G.info(f"采样跳过：{type(e).__name__}: {e}")
+    timer.mark("采样")
     G.info("=== 4/4 报告 ===")
     report.run(a.slug)
+    print(timer.summary())
 
 
 def cmd_plan(a):
@@ -384,6 +496,11 @@ def cmd_serve(a):
     import tasks
     import verify as V
 
+    pre = _preflight(a, slug=a.slug, full=False)
+    print(BUDGET.table(pre["est"]))
+    _guard(a, pre)
+    timer = BUDGET.Timer()
+    timer.mark("start")
     G.info("═══ 1/7 抓取 ═══")
     C.run(a.slug, max_pages=a.max_pages)
     G.info("═══ 2/7 体检 ═══")
@@ -395,9 +512,14 @@ def cmd_serve(a):
         G.info("跳过：--no-sample")
     else:
         try:
-            S.run(a.slug, limit=a.limit)
+            S.run(a.slug, limit=a.limit, profile_name=pre["prof"]["name"],
+                  budget_minutes=pre["budget"], assume_yes=getattr(a, "yes", False),
+                  all_questions=getattr(a, "all_questions", False))
+        except SystemExit:
+            raise
         except Exception as e:  # noqa: BLE001
             G.info(f"采样跳过：{type(e).__name__}: {e}")
+    timer.mark("采样")
     G.info("═══ 4/7 生成工单与建设蓝图 ═══")
     tasks.build(a.slug)
     import blueprint
@@ -410,6 +532,7 @@ def cmd_serve(a):
     V.run(a.slug, recrawl=False)
     G.info("═══ 打包交付 ═══")
     deliver.run(a.slug)
+    print(timer.summary())
 
 
 def cmd_ui(a):
@@ -431,6 +554,21 @@ def cmd_list(a):
             print(f"{d.name:20s} {cfg.get('brand', {}).get('name', ''):22s} 问题 {len(cfg.get('questions', [])):3d}  最近报告 {last}")
 
 
+def _add_budget_args(p, with_all_questions: bool = False):
+    """所有会跑采样的命令统一挂这套参数。"""
+    p.add_argument("--profile", choices=list(BUDGET.PROFILES), default=None,
+                   help="预算档位：quick≈5分钟 / standard≈10分钟 / deep≈20分钟")
+    p.add_argument("--budget", type=float, default=None,
+                   help="接受的最长分钟数；预估超过它会先问，非交互环境直接拒绝")
+    p.add_argument("--yes", action="store_true",
+                   help="我确认要花这么久，不再询问")
+    p.add_argument("--estimate", action="store_true",
+                   help="只打印预估耗时与调用次数，不跑")
+    if with_all_questions:
+        p.add_argument("--all-questions", action="store_true", dest="all_questions",
+                       help="忽略 profile 的每组题量封顶，跑题库全部题目（慢）")
+
+
 def main():
     p = argparse.ArgumentParser(prog="geo", description="GEO 自动化管线")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -440,7 +578,10 @@ def main():
     s.add_argument("--name")
     s.add_argument("--slug")
     s.add_argument("--market", choices=["cn", "global", "both"], default="cn")
-    s.add_argument("--max-pages", type=int, default=25, dest="max_pages")
+    s.add_argument("--max-pages", type=int, default=None, dest="max_pages",
+                   help="抓多少页（默认按 profile：quick 12 / standard 20 / deep 40）")
+    s.add_argument("--profile", choices=list(BUDGET.PROFILES), default=None,
+                   help="预算档位：quick≈5分钟 / standard≈10分钟 / deep≈20分钟")
     s.add_argument("--force", action="store_true", help="项目已存在时清空重建（危险）")
     s.set_defaults(func=cmd_init)
 
@@ -449,8 +590,10 @@ def main():
     s.add_argument("--name")
     s.add_argument("--slug")
     s.add_argument("--market", choices=["cn", "global", "both"], default="both")
-    s.add_argument("--max-pages", type=int, default=25, dest="max_pages")
+    s.add_argument("--max-pages", type=int, default=None, dest="max_pages",
+                   help="抓多少页（默认按 profile：quick 12 / standard 20 / deep 40）")
     s.add_argument("--limit", type=int, default=None, help="采样只跑前 N 题")
+    _add_budget_args(s)
     s.add_argument("--no-sample", action="store_true", dest="no_sample")
     s.add_argument("--skip-llm", action="store_true", dest="skip_llm", help="不用 LLM 推导底座")
     s.add_argument("--draft", action="store_true")
@@ -460,7 +603,9 @@ def main():
 
     s = sub.add_parser("autopilot", help="对已有项目跑完整引导流程")
     s.add_argument("--slug", required=True)
+    s.add_argument("--max-pages", type=int, default=None, dest="max_pages")
     s.add_argument("--limit", type=int, default=None)
+    _add_budget_args(s)
     s.add_argument("--no-sample", action="store_true", dest="no_sample")
     s.add_argument("--skip-llm", action="store_true", dest="skip_llm")
     s.set_defaults(func=cmd_autopilot)
@@ -485,9 +630,10 @@ def main():
 
     s = sub.add_parser("sample", help="API 平台答案采样")
     s.add_argument("--slug", required=True)
-    s.add_argument("--platforms", help="逗号分隔，默认取 geo.json 里有 Key 的")
+    s.add_argument("--platforms", help="逗号分隔，默认按 profile 推荐平台")
     s.add_argument("--repeat", type=int, default=1, help="每题重复采样次数")
     s.add_argument("--limit", type=int, default=None, help="只跑前 N 个问题")
+    _add_budget_args(s, with_all_questions=True)
     s.set_defaults(func=cmd_sample)
 
     s = sub.add_parser("sample-sheet", help="导出人工/浏览器采样表")
@@ -507,6 +653,7 @@ def main():
     s.add_argument("--slug", required=True)
     s.add_argument("--max-pages", type=int, default=None, dest="max_pages")
     s.add_argument("--limit", type=int, default=None)
+    _add_budget_args(s, with_all_questions=True)
     s.set_defaults(func=cmd_cycle)
 
     s = sub.add_parser("plan", help="诊断结果 → 结构化工单（含验收标准）")
@@ -563,6 +710,7 @@ def main():
     s.add_argument("--no-sample", action="store_true", dest="no_sample")
     s.add_argument("--draft", action="store_true", help="额外生成文章初稿")
     s.add_argument("--draft-limit", type=int, default=3, dest="draft_limit")
+    _add_budget_args(s, with_all_questions=True)
     s.set_defaults(func=cmd_serve)
 
     s = sub.add_parser("ui", help="启动可观测看板（趋势、工单、信源、验收历史）")

@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
+import budget as BUDGET
 import geolib as G
 
 # 中文站常见的高价值路径关键词 → 优先抓
@@ -151,7 +152,13 @@ def check_crawl_health(pages: list[dict]):
 def run(slug: str, max_pages: int | None = None, delay: float = 0.5) -> dict:
     cfg = G.load_config(slug)
     root = cfg["brand"]["site"].rstrip("/")
-    limit = max_pages or cfg.get("pages", {}).get("max", 25)
+    # 抓页数决定体检的代表性，也决定耗时（同域串行 + 礼貌延迟约 2.2s/页）。
+    # 优先级：命令行 > 项目配置 > profile 预设
+    prof = BUDGET.profile((cfg.get("profile") or {}).get("name"))
+    limit = max_pages or cfg.get("pages", {}).get("max") or prof["pages"]
+    if limit > 60:
+        G.info(f"提示：抓 {limit} 页约需 {limit * 2.2 / 60:.0f} 分钟；体检是抽样，"
+               f"40 页已足够代表站点结构，调小可用 --max-pages")
     outdir = G.project_dir(slug) / "evidence"
     (outdir / "html").mkdir(parents=True, exist_ok=True)
 

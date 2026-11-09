@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 import requests
 
+import budget as BUDGET
 import geolib as G
 
 # 平台注册表：code -> 配置。market 决定这个平台该问哪一套问题库。
@@ -57,7 +58,7 @@ PROVIDERS = {
     "deepseek": {
         "name": "DeepSeek", "market": "cn",
         "base": "https://api.deepseek.com/v1",
-        "model": os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+        "model": os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-1-flash-260910"),
         "model_env": "DEEPSEEK_MODEL",
         "key_env": "DEEPSEEK_API_KEY",
         "search": False,
@@ -105,7 +106,7 @@ PROVIDERS = {
         "name": "Claude", "market": "global",
         "protocol": "anthropic",
         "base": "https://api.anthropic.com/v1",
-        "model": os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5"),
+        "model": os.environ.get("ANTHROPIC_MODEL", "claude-haiku-5-5"),
         "model_env": "ANTHROPIC_MODEL",
         "key_env": "ANTHROPIC_API_KEY",
         "search": False,
@@ -149,24 +150,24 @@ MANUAL_ONLY = {
 AI302AI_BASE = "https://api.302ai.cn/v1"
 # code -> 默认模型 + 覆盖用的 env 名；未列出的平台不支持 302.AI 替代
 AI302AI_PROVIDERS = {
-    # GLM：智谱最新是 glm-5.2（旗舰）/ glm-4.7-flashx（轻量），采样选轻量档
-    "glm":        {"model": "glm-4.7-flashx",             "model_env": "AI302AI_GLM_MODEL"},
+    # GLM：智谱 latest 是 glm-5.2（旗舰）/ glm-5.3-flash（轻量），采样选轻量档
+    "glm":        {"model": "glm-5.3-flash",             "model_env": "AI302AI_GLM_MODEL"},
     # Doubao：字节最新是 seed-2-1（2026-06-28），lite 太弱，选 turbo 平衡
     "doubao":     {"model": "doubao-seed-2-1-turbo-260628","model_env": "AI302AI_ARK_MODEL"},
-    # DeepSeek：v4-flash 是 2026 最新轻量档（v4-pro 太重，采样不划算）
-    "deepseek":   {"model": "deepseek-v4-flash",          "model_env": "AI302AI_DEEPSEEK_MODEL"},
+    # DeepSeek：v4.1-flash 是最新轻量档（v4-pro 太重，采样不划算）
+    "deepseek":   {"model": "deepseek-v4-1-flash-260910",          "model_env": "AI302AI_DEEPSEEK_MODEL"},
     # Kimi：2026 月之暗面最新是 kimi-k3（已非 preview）
     "kimi":       {"model": "kimi-k3",                    "model_env": "AI302AI_KIMI_MODEL"},
     # MiniMax：M3 是我自己（跑这个 agent 的），采样用上一代 M2.7
-    "minimax":    {"model": "MiniMax-M2.7",               "model_env": "AI302AI_MINIMAX_MODEL"},
-    # Gemini：3.5-flash 是 2026 稳定轻量档（3.6-flash 偏新可能不稳）
-    "gemini":     {"model": "gemini-3.5-flash",           "model_env": "AI302AI_GEMINI_MODEL"},
+    "minimax":    {"model": "MiniMax-M3",               "model_env": "AI302AI_MINIMAX_MODEL"},
+    # Gemini：3.8-flash 是当前最新轻量档
+    "gemini":     {"model": "gemini-3.8-flash",           "model_env": "AI302AI_GEMINI_MODEL"},
     # OpenAI：2026-03 发布的 gpt-5.4-mini 是当前最快轻量档
     "openai":     {"model": "gpt-5.4-mini",               "model_env": "AI302AI_OPENAI_MODEL"},
     # Claude：sonnet-5 是 2026 当前主力（opus-5 太贵，采样用 sonnet 够）
-    "claude":     {"model": "claude-sonnet-5",            "model_env": "AI302AI_CLAUDE_MODEL"},
+    "claude":     {"model": "claude-haiku-5-5",            "model_env": "AI302AI_CLAUDE_MODEL"},
     # Grok：4.5 刚出（贵），4.1 是 2026 性价比档
-    "grok":       {"model": "grok-4.1",                  "model_env": "AI302AI_GROK_MODEL"},
+    "grok":       {"model": "grok-4-1-fast-non-reasoning",                  "model_env": "AI302AI_GROK_MODEL"},
     # Perplexity：sonar 仍是 2026 基础联网档，pro/reasoning 在 .env 覆盖
     "perplexity": {"model": "sonar",                      "model_env": "AI302AI_PERPLEXITY_MODEL"},
 }
@@ -179,7 +180,7 @@ AI302AI_PROVIDERS = {
 # ============================================================
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 OPENROUTER_PROVIDERS = {
-    # DeepSeek：v4-flash 是 2026 最新轻量档（v4-pro 太重，采样不划算）
+    # DeepSeek：v4.1-flash 是最新轻量档（v4-pro 太重，采样不划算）
     "deepseek":   {"model": "deepseek/deepseek-v4-flash",   "model_env": "OPENROUTER_DEEPSEEK_MODEL"},
     # Kimi：k3 已是 2026 stable（不再 preview）
     "kimi":       {"model": "moonshotai/kimi-k3",           "model_env": "OPENROUTER_KIMI_MODEL"},
@@ -850,12 +851,50 @@ def confirm_competitors(slug: str, rows: list[dict]):
 # ------------------------------------------------------------ 命令
 
 
-def run(slug: str, platforms: list[str] | None = None, repeat: int = 1, limit: int | None = None) -> dict:
+def _cap_per_group(qs: list[dict], per_group: int | None) -> list[dict]:
+    """按组封顶。profile 越小，每组留的题越少——采样成本几乎全部来自这里。"""
+    if not per_group:
+        return qs
+    kept, seen = [], {}
+    for q in qs:
+        g = q.get("group") or "推荐"
+        if seen.get(g, 0) >= per_group:
+            continue
+        seen[g] = seen.get(g, 0) + 1
+        kept.append(q)
+    return kept
+
+
+def run(slug: str, platforms: list[str] | None = None, repeat: int = 1,
+        limit: int | None = None, profile_name: str | None = None,
+        budget_minutes: float | None = None, assume_yes: bool = False,
+        per_platform: int | None = None, timeout: int | None = None,
+        all_questions: bool = False, estimate_only: bool = False) -> dict:
+    """多平台答案采样。
+
+    成本控制（这是整个管线里最贵的一步，默认值必须保守）：
+      - 平台：显式 --platforms > profile 推荐 > 配置里有 Key 的全部
+      - 题量：profile 的 per_group 封顶；--all-questions 可解封
+      - 并发：平台间并发 × 平台内并发（默认 3），封顶 12 路
+      - 单题超时：默认 75s（GEO_SAMPLE_TIMEOUT 可调）
+      - 熔断：某平台连续 3 题失败就停掉该平台，别在坏端点上耗半小时
+      - 闸门：预估超预算先问；非交互环境拒绝执行
+    """
     cfg = G.load_config(slug)
     if not cfg.get("questions"):
         G.die("geo.json 里还没有问题库，先让 Claude 生成 questions（见 SKILL.md 步骤 2）")
 
-    plats = platforms or [p for p in cfg.get("platforms", []) if p in PROVIDERS]
+    profile_name = profile_name or (cfg.get("profile") or {}).get("name") or BUDGET.DEFAULT_PROFILE
+    prof = BUDGET.profile(profile_name)
+    market = cfg.get("market", "cn")
+
+    # 1) 平台
+    if platforms:
+        plats = platforms
+    else:
+        wanted = BUDGET.platforms_for(profile_name, market)
+        plats = [p for p in wanted if available(p)] or \
+                [p for p in cfg.get("platforms", []) if available(p)]
     runnable = [p for p in plats if available(p)]
     skipped = [p for p in plats if not available(p)]
     if skipped:
@@ -864,17 +903,56 @@ def run(slug: str, platforms: list[str] | None = None, repeat: int = 1, limit: i
         G.info("没有可用的 API 平台。用 `geo.py sample-sheet` 导出人工/浏览器采样清单。")
         return {}
 
-    # 任务清单：平台 × 问题 × 轮次
-    jobs = []
+    # 2) 题量
+    per_plat_qs: dict[str, list[dict]] = {}
     for plat in runnable:
-        questions = questions_for(cfg, plat)
-        if limit:
-            questions = questions[:limit]
-        if not questions:
+        qs = questions_for(cfg, plat)
+        if not all_questions:
+            capped = _cap_per_group(qs, prof["per_group"])
+            if limit:
+                capped = capped[:limit]
+            if len(capped) != len(qs):
+                G.info(f"[{plat}] 题量按 profile「{prof['label']}」从 {len(qs)} 砍到 {len(capped)}"
+                       f"（每组最多 {prof['per_group']} 题；要全跑加 --all-questions）")
+            qs = capped
+        elif limit:
+            qs = qs[:limit]
+        if not qs:
             G.info(f"跳过 {plat}：问题库里没有 {market_of(plat)} 市场的问题")
             continue
-        G.info(f"[{plat}] {market_of(plat)} 市场 · {len(questions)} 题 × {repeat} 轮")
-        for q in questions:
+        per_plat_qs[plat] = qs
+        G.info(f"[{plat}] {market_of(plat)} 市场 · {len(qs)} 题 × {repeat} 轮")
+    if not per_plat_qs:
+        return {}
+
+    runnable = list(per_plat_qs)
+    per_platform = per_platform or int(os.environ.get("GEO_SAMPLE_PER_PLATFORM", "3"))
+    call_timeout = timeout or int(os.environ.get("GEO_SAMPLE_TIMEOUT", "75"))
+
+    # 3) 预估 + 闸门（跑之前就把代价摊开给用户看）
+    n_q = max(len(v) for v in per_plat_qs.values())
+    est = BUDGET.estimate_sampling(n_q, runnable, repeat, per_platform)
+    G.info(f"采样预估：{est['calls']} 次调用 / {est['concurrency']} 路并发 / 约 {est['minutes']} 分钟")
+    if estimate_only:
+        print(BUDGET.table({"profile": prof["name"], "profile_label": prof["label"],
+                            "market": market, "minutes": est["minutes"],
+                            "steps": [{"name": "AI 答案采样", "minutes": est["minutes"],
+                                       "detail": f"{n_q} 题 × {len(runnable)} 平台 × {repeat} 轮"
+                                                 f" = {est['calls']} 次调用；{est['concurrency']} 路并发"}],
+                            "pages": 0, "questions": n_q}))
+        return {"estimate": est}
+    BUDGET.guard({"minutes": est["minutes"], "profile": prof["name"],
+                  "profile_label": prof["label"], "market": market, "pages": 0,
+                  "questions": n_q,
+                  "steps": [{"name": "AI 答案采样", "minutes": est["minutes"],
+                             "detail": f"{n_q} 题 × {len(runnable)} 平台 × {repeat} 轮"
+                                       f" = {est['calls']} 次调用；{est['concurrency']} 路并发"}]},
+                budget_minutes, assume_yes)
+
+    # 4) 任务清单
+    jobs = []
+    for plat, qs in per_plat_qs.items():
+        for q in qs:
             for k in range(repeat):
                 jobs.append((plat, q, k + 1))
 
@@ -882,10 +960,20 @@ def run(slug: str, platforms: list[str] | None = None, repeat: int = 1, limit: i
     path = pdir / "samples" / f"{G.today()}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 断点续采：已经有样本的 (平台, 题号, 轮次) 不再重跑。采样既慢又花钱。
+    done_keys = {(r.get("platform"), r.get("question_id"), r.get("round"))
+                 for r in G.read_jsonl(path) if r.get("ok")}
+    before = len(jobs)
+    jobs = [j for j in jobs if (j[0], j[1].get("id"), j[2]) not in done_keys]
+    if before != len(jobs):
+        G.info(f"断点续采：跳过已完成 {before - len(jobs)} 条，待采 {len(jobs)} 条")
+    if not jobs:
+        G.info("所有题目都已有样本，直接算指标")
+
     def one(job):
         plat, q, rnd = job
         t0 = time.monotonic()
-        res = ask(plat, q["text"])
+        res = ask(plat, q["text"], timeout=call_timeout)
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         rec = {
             "date": G.today(), "ts": G.now_iso(),
@@ -907,45 +995,109 @@ def run(slug: str, platforms: list[str] | None = None, repeat: int = 1, limit: i
         rec["needs_review"] = bool(rec["analysis"].get("needs_review"))
         return rec
 
-    # 平台之间互不相干，并发跑；单个平台内部串行以免触发限流。
-    # 推理型模型单次可达 90s，串行跑几十题会拖到一小时以上。
+    hard_timeout = int(os.environ.get(
+        "GEO_SAMPLE_HARD_TIMEOUT", str(int(call_timeout * 1.6))))
+
+    def one_bounded(job) -> dict:
+        """给单题套一个墙钟上限，超了就判失败，绝不让一题吃掉几分钟。"""
+        box: dict = {}
+
+        def _run():
+            try:
+                box["rec"] = one(job)
+            except Exception as e:  # noqa: BLE001
+                box["err"] = f"{type(e).__name__}: {e}"
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
+        th.join(hard_timeout)
+        if "rec" in box:
+            return box["rec"]
+        plat, q, rnd = job
+        return {
+            "date": G.today(), "ts": G.now_iso(),
+            "platform": plat, "platform_name": PROVIDERS[plat]["name"],
+            "market": market_of(plat), "terminal": "api", "sample_mode": "api",
+            "evidence_level": "B_api_可复现",
+            "search_enabled": PROVIDERS[plat].get("search", False),
+            "question_id": q.get("id"), "question": q["text"], "round": rnd,
+            "brand_in_question": brand_in_question(q["text"], cfg),
+            "ok": False,
+            "error": box.get("err") or f"hard timeout {hard_timeout}s（单题墙钟上限）",
+            "elapsed_ms": hard_timeout * 1000,
+            "answer": "", "citations": [],
+            "analysis": {"brand_mentioned": False, "brand_rank": 0, "candidates": [],
+                         "competitors_mentioned": [], "cited_domains": [],
+                         "own_domain_cited": False, "answer_chars": 0,
+                         "needs_review": False, "negative_cues": []},
+            "needs_review": False,
+        }
+
     rows, done, total = [], 0, len(jobs)
     lock = threading.Lock()
+    streak = {p: 0 for p in runnable}      # 连续失败计数
+    disabled: dict[str, str] = {}          # 熔断的平台 → 原因
     fh = path.open("a", encoding="utf-8")  # 增量落盘：中途挂掉也不丢已采样本
 
     def worker(plat_jobs):
         nonlocal done
         out = []
         for job in plat_jobs:
-            rec = one(job)
+            plat = job[0]
+            with lock:
+                if plat in disabled:
+                    done += 1
+                    print(f"[geo] {done:3d}/{total} ⊘ [{plat}] 已熔断，跳过：{job[1]['text'][:26]}",
+                          file=sys.stderr, flush=True)
+                    continue
+            rec = one_bounded(job)
             with lock:
                 done += 1
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 fh.flush()
+                if rec["ok"]:
+                    streak[plat] = 0
+                else:
+                    streak[plat] = streak.get(plat, 0) + 1
+                    if streak[plat] >= 3 and plat not in disabled:
+                        disabled[plat] = str(rec.get("error"))[:120]
+                        G.info(f"熔断 {plat}：连续 {streak[plat]} 题失败（{disabled[plat]}），"
+                               f"停掉该平台剩余题目，别在坏端点上耗时间")
                 flag = "✓" if rec["analysis"]["brand_mentioned"] else ("✗" if not rec["ok"] else "·")
                 print(f"[geo] {done:3d}/{total} {flag} [{rec['platform']}] {rec['question'][:32]}",
                       file=sys.stderr, flush=True)
             out.append(rec)
-            time.sleep(0.4)
+            time.sleep(0.3)
         return out
 
+    chunks = []
     by_plat: dict[str, list] = {}
     for job in jobs:
         by_plat.setdefault(job[0], []).append(job)
-    with ThreadPoolExecutor(max_workers=max(1, len(by_plat))) as ex:
-        for fut in as_completed([ex.submit(worker, v) for v in by_plat.values()]):
+    for plat, items in by_plat.items():
+        for i in range(per_platform):
+            part = items[i::per_platform]
+            if part:
+                chunks.append(part)
+    G.info(f"并发 {len(chunks)} 路（{len(by_plat)} 平台 × 最多 {per_platform} 路），"
+           f"单题超时 {call_timeout}s / 硬上限 {hard_timeout}s")
+    with ThreadPoolExecutor(max_workers=max(1, len(chunks))) as ex:
+        for fut in as_completed([ex.submit(worker, v) for v in chunks]):
             try:
                 rows.extend(fut.result())
             except Exception as e:  # noqa: BLE001
-                G.info(f"某平台采样中断：{type(e).__name__}: {e}")
+                G.info(f"某路采样中断：{type(e).__name__}: {e}")
     fh.close()
+    if disabled:
+        G.info("本期熔断的平台：" + "、".join(f"{k}({v})" for k, v in disabled.items())
+               + "；这些平台的指标样本不足，报告里会标『样本不足』")
 
     all_rows = dedup_rows(G.read_jsonl(path))
     ok_rows = [r for r in all_rows if r.get("ok")]
     metrics = {
         "slug": slug, "date": G.today(), "generated_at": G.now_iso(),
         "question_count": len(cfg.get("questions", [])), "sample_count": len(all_rows),
-        "platforms": aggregate(ok_rows, cfg),
+        "profile": prof["name"], "platforms": aggregate(ok_rows, cfg),
     }
     G.write_json(pdir / "metrics" / f"{G.today()}.json", metrics)
     confirm_competitors(slug, ok_rows)

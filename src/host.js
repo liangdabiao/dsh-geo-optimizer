@@ -7,6 +7,7 @@ import { systemSection } from './systemPrompt.js'
 import { registerApi } from '../lib/api.js'
 import { auditContent } from '../lib/audit.js'
 import { listAudits, saveAudit, deleteAudit } from '../lib/data.js'
+import { syncFromConfig } from '../lib/env.js'
 
 export const name = 'geo-optimizer'
 
@@ -14,6 +15,15 @@ export const inject = ['tools', 'skills', 'systemPrompt', 'webServer', 'connecti
 
 export const Config = Schema.object({
   injectRules: Schema.boolean().default(true).description('注入 GEO 方法论到系统提示'),
+
+  ai302aiKey: Schema.string().role('secret').default('')
+    .description('302.AI API Key（聚合 10 个 AI 引擎，填了这个才能跑「AI 答案采样」；只写进 skills/geolook/.env，不会回显）'),
+  openrouterKey: Schema.string().role('secret').default('')
+    .description('OpenRouter API Key（可选，与 302.AI 二选一）'),
+  useFastModels: Schema.boolean().default(true)
+    .description('用 flash/mini 版模型（glm-5.3-flash、deepseek-v4-1-flash、gemini-3.8-flash、claude-haiku-5-5…）速度是推理版的 3-5 倍'),
+  sampleProfile: Schema.union(['quick', 'standard', 'deep']).default('standard')
+    .description('采样档位：quick≈5分钟 / standard≈10分钟 / deep≈20分钟；超预算会先问再跑'),
 })
 
 function check(args, spec) {
@@ -127,5 +137,12 @@ export function apply(ctx, config) {
     ctx.effect(() => ctx.systemPrompt.section(systemSection()), `${name}: methodology`)
   }
 
-  ctx.effect(() => registerApi(ctx, { skillDirs }), `${name}: routes`)
+  // 面板里填的 key / 档位 → skills/geolook/.env（Python 管线只认 .env）
+  ctx.effect(() => {
+    const r = syncFromConfig(config)
+    if (r.written) ctx.logger?.info?.(`[geo] 已同步 302.AI 配置到 ${r.path}`)
+    return () => {}
+  }, `${name}: env sync`)
+
+  ctx.effect(() => registerApi(ctx, { skillDirs, config }), `${name}: routes`)
 }

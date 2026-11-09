@@ -1,6 +1,6 @@
 {
   "name": "dsh-geo-optimizer",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "GEO 内容优化工作台：geo_audit 确定性审计打分（引用/结构化/问答/权威四维）+ 前后对比 + 审计历史。侧栏审计面板。",
   "license": "MIT",
   "type": "module",
