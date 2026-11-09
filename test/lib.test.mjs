@@ -1,12 +1,17 @@
 // 快照合规 + provider + addendum + 泄露 key 扫描 + API 单测。零 dsh 依赖零网络。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SKILLS_ROOT = join(ROOT, 'skills')
+
+// 必须在 import 任何碰 data.js 的模块之前设好隔离目录：
+// api.js → data.js 在导入时就确定 DATA_DIR，晚一步就会把测试记录写进用户真实的 ~/.dsh
+process.env.DSH_HOME = new URL('../.tmp/test-home/', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:')
+
 const { createSkillProvider, readDir } = await import('../lib/skills.js')
 const { systemSection } = await import('../src/systemPrompt.js')
 const { requestRejection } = await import('../lib/api.js')
@@ -100,11 +105,14 @@ test('LICENSE 为 MIT', () => {
 })
 
 // ── 升级新增：geo_audit ─────────────────────────────────────
-process.env.DSH_HOME = new URL('../.tmp/test-home/', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:')
 
 const { auditContent } = await import('../lib/audit.js')
 const data = await import('../lib/data.js')
 const host = await import('../src/host.js')
+
+// 兜底：任何情况下都不许写真实档案库
+assert.match(data.DATA_DIR, /[\\/]\.tmp[\\/]test-home[\\/]geo-optimizer$/, `测试写到了 ${data.DATA_DIR}`)
+rmSync(data.DATA_DIR, { recursive: true, force: true })
 
 test('audit: 四维打分——优质内容高分、空洞内容低分', () => {
   const rich = auditContent([

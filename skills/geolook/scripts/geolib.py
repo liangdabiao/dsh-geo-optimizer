@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import sys
 import time
 from contextlib import contextmanager
@@ -47,14 +48,29 @@ def load_env(path: Path | None = None):
 load_env()
 
 
+def _proxy_alive(proxy: str, timeout: float = 0.6) -> bool:
+    """探测代理端口是否真的有人监听——系统里躺着一个失效代理是最常见的坑。"""
+    host, _, port = proxy.rpartition(":")
+    if not host or not port.isdigit():
+        return False
+    try:
+        with socket.create_connection((host.strip("[]") or "127.0.0.1", int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _setup_proxy():
     """自动检测系统代理：国内用户 302.AI / OpenAI 走海外域名，必须有代理。
     优先级：
+      0) AI302AI_NO_AUTO_PROXY=1 → 完全不自动设置（文档里承诺过的开关）
       1) 用户已设 HTTP_PROXY/HTTPS_PROXY → 不动
-      2) WinHTTP 系统代理（Windows 常见，PowerShell/IE 设的）→ 转发给 requests
+      2) WinHTTP 系统代理 → 转发给 requests（但先探活，失效就跳过并提示）
       3) 全局 CN-only 提示：让用户知道 .env 里要写 HTTPS_PROXY
     返回值仅供信息展示，无外部副作用。
     """
+    if os.environ.get("AI302AI_NO_AUTO_PROXY") == "1":
+        return
     if os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY"):
         return  # 用户已经设过
     if sys.platform != "win32":
@@ -65,12 +81,25 @@ def _setup_proxy():
             ["netsh", "winhttp", "show", "proxy"],
             capture_output=True, text=True, timeout=3,
         )
-        m = re.search(r"Proxy Server\(s\)\s*:\s*(\S+)", out.stdout)
-        if m and m.group(1).lower() != "direct":
-            proxy = m.group(1).strip()
-            os.environ["HTTP_PROXY"] = f"http://{proxy}"
-            os.environ["HTTPS_PROXY"] = f"http://{proxy}"
-            info(f"已自动设置系统代理：{proxy}（如需关闭：unset HTTPS_PROXY / set AI302AI_NO_AUTO_PROXY=1）")
+        # 英文 "Proxy Server(s) : host:port" / 中文 "代理服务器: host:port"；
+        # "Direct"、"直接访问" 表示没设代理
+        m = re.search(r"(?:Proxy Server\(s\)|代理服务器(?:\(s\))?)\s*[:：]\s*(\S+)", out.stdout)
+        if not m:
+            return
+        proxy = m.group(1).strip()
+        if proxy.lower() in ("direct", "直接访问", "(none)", "无"):
+            return
+        if not re.fullmatch(r"[\w.\-\[\]]+:\d+", proxy):
+            return
+        if not _proxy_alive(proxy):
+            info(
+                f"系统代理 {proxy} 连不上，已跳过自动代理（不影响国内端点）。"
+                f"需要走代理请在 .env 里写 HTTPS_PROXY=http://127.0.0.1:7890"
+            )
+            return
+        os.environ["HTTP_PROXY"] = f"http://{proxy}"
+        os.environ["HTTPS_PROXY"] = f"http://{proxy}"
+        info(f"已自动设置系统代理：{proxy}（如需关闭：在 .env 写 AI302AI_NO_AUTO_PROXY=1）")
     except Exception:  # noqa: BLE001
         pass
 
