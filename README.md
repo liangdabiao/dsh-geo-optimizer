@@ -4,6 +4,9 @@ DeepSeek Harness（dsh）插件：**生成式引擎优化（GEO）三个技能**
 
 技能来自 [GEO-Content-Optimizer-Skill](https://github.com/liangdabiao/GEO-Content-Optimizer-Skill)（MIT，liangdabiao；geolook 技能 MIT）。**纯技能零 API key**。
 
+
+<img width="2487" height="1113" alt="image" src="https://github.com/user-attachments/assets/a1b4cac0-7ce8-4d10-9330-c96185368cf9" />
+
 ## GEO vs SEO
 
 **SEO 是让 Google 搜到你，GEO 是让 AI 在回答时"提到你"。** 如果 AI 回答里提到你的竞品但没提到你——你就在 AI 时代"隐形"了。
