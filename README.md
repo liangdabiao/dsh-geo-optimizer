@@ -67,7 +67,7 @@ npm install && npm test && npm run selftest && npm run build
 ## 安装
 
 ```bash
-dsh plugin --profile web add dsh-geo-optimizer
+dsh plugin --profile web add https://github.com/liangdabiao/dsh-geo-optimizer
 ```
 
 ## 许可
